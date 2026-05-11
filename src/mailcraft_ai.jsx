@@ -26,6 +26,7 @@ async function claude(system, user, maxTokens = 3000) {
 // SHEET READER
 // ─────────────────────────────────────────────────────────────
 function readWorkbook(buffer) {
+  console.log("Reading workbook from file buffer…");
   const wb = XLSX.read(buffer, { type: "array" });
   const sheets = {};
   wb.SheetNames.forEach((name) => {
@@ -33,6 +34,7 @@ function readWorkbook(buffer) {
       header: 1, defval: "", raw: false,
     });
   });
+  console.log("readWebhook")
   return { names: wb.SheetNames, sheets };
 }
 
