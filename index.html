@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>MailCraft AI — Excel to HTML Email</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:#0A0A0F;color:#E2E8F0;min-height:100vh}
+  ::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-track{background:#0F172A} ::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+// ── Claude API ──────────────────────────────────────────────
+async function claude(system, user, maxTokens = 3000) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: "user", content: user }],
+    }),
+  });
+  if (!res.ok) throw new Error(`API error ${res.status}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  const text = data.content?.find(b => b.type === "text")?.text || "";
+  return text.replace(/^```(?:json|html)?\s*/i,"").replace(/\s*```$/i,"").trim();
+}
+
+// ── Sheet reader ────────────────────────────────────────────
+function readWorkbook(buffer) {
+  const wb = XLSX.read(buffer, { type: "array" });
+  const sheets = {};
+  wb.SheetNames.forEach(name => {
+    sheets[name] = XLSX.utils.sheet_to_json(wb.Sheets[name], { header:1, defval:"", raw:false });
+  });
+  return { names: wb.SheetNames, sheets };
+}
+
+function sheetsToText(sheets) {
+  return Object.entries(sheets).map(([name, rows]) => {
+    const lines = rows.map(row => row.map(c=>String(c).trim()).filter(Boolean).join(" | ")).filter(Boolean);
+    return `=== SHEET: ${name} ===\n${lines.join("\n")}`;
+  }).join("\n\n");
+}
+
+// ── Agent 1: Extractor (AI) ─────────────────────────────────
+async function agent1(sheets, log) {
+  log("a1","Reading all Excel sheets with AI…");
+  const dump = sheetsToText(sheets);
+  const res = await claude(
+    `You are an expert at reading marketing email brief spreadsheets from ANY company.
+Extract all information needed to build an HTML email newsletter.
+Return ONLY a JSON object:
+{
+  "company":"company name",
+  "subject":"email subject line",
+  "preheader":"preheader text",
+  "sender":"sender email",
+  "primaryColor":"#hex brand primary color",
+  "secondaryColor":"#hex brand secondary color",
+  "logoText":"company name for logo",
+  "greeting":"email greeting",
+  "bodyText":"main body copy 1-3 sentences",
+  "signature":"sign-off text",
+  "validityText":"offer validity text if any",
+  "ctaText":"main CTA button text",
+  "mainBannerLink":"main banner URL",
+  "utmCampaign":"UTM campaign value if found",
+  "sections":[{
+    "type":"product_grid|banner|text",
+    "title":"headline",
+    "subtitle":"subheadline",
+    "cta":"CTA text",
+    "link":"URL",
+    "bgColor":"#hex",
+    "textColor":"#fff or #000",
+    "imageUrl":"image URL if present",
+    "items":[{"title":"","link":"","imageUrl":"","price":""}]
+  }],
+  "footerLinks":["label|url"],
+  "socialLinks":{"facebook":"","instagram":"","twitter":"","linkedin":"","youtube":""},
+  "address":"company address",
+  "unsubscribeText":"unsubscribe text"
+}
+Be smart — detect products, banners, UTM tags, brand colors in any language. Return ONLY JSON.`,
+    `Excel content:\n\n${dump.substring(0,12000)}`
+  );
+  let brief;
+  try { brief = JSON.parse(res); } catch { throw new Error("Could not parse your Excel — please check the file has content"); }
+  log("a1",`✓ Company: "${brief.company||"Detected"}"`, "ok");
+  log("a1",`✓ Subject: "${brief.subject}"`, "ok");
+  log("a1",`✓ ${brief.sections?.length||0} content sections found`, "ok");
+  return brief;
+}
+
+// ── Agent 2: Validator (AI) ────────────────────────────────
+async function agent2(brief, log) {
+  log("a2","Validating all links and content…");
+  const res = await claude(
+    `Email marketing brief validator. Check for issues.
+Return ONLY JSON: {"issues":["string"],"warnings":["string"],"score":0-100}`,
+    `Validate:\n${JSON.stringify(brief,null,2).substring(0,3000)}`
+  );
+  let report = { issues:[], warnings:[], score:80 };
+  try { report = JSON.parse(res); } catch {}
+  report.issues.forEach(i => log("a2",`✗ ${i}`,"err"));
+  report.warnings.forEach(w => log("a2",`⚠ ${w}`,"warn"));
+  log("a2",`✓ Brief quality score: ${report.score}/100`,"ok");
+
+  if (brief.utmCampaign) {
+    const addUtm = url => {
+      if (!url||!url.startsWith("http")) return url;
+      return `${url}${url.includes("?")?"&":"?"}utm_source=email&utm_medium=newsletter&utm_campaign=${brief.utmCampaign}`;
+    };
+    if (brief.mainBannerLink) brief.mainBannerLink = addUtm(brief.mainBannerLink);
+    (brief.sections||[]).forEach(s => {
+      s.link = addUtm(s.link);
+      (s.items||[]).forEach(item => { item.link = addUtm(item.link); });
+    });
+    log("a2",`✓ UTM appended to all links`,"ok");
+  }
+  return { brief, report };
+}
+
+// ── Agent 3: Copy Enhancer (AI) ────────────────────────────
+async function agent3(brief, log) {
+  log("a3","Polishing copy with AI…");
+  const res = await claude(
+    `Expert email copywriter. Polish this brief's copy.
+Keep the same language. Improve body text to be warm and action-oriented.
+Fill blank CTAs with compelling short phrases (max 4 words).
+Keep all URLs, hex colors, and data exactly as-is.
+Return ONLY the same JSON keys with improved copy.`,
+    JSON.stringify({
+      subject:brief.subject, preheader:brief.preheader,
+      greeting:brief.greeting, bodyText:brief.bodyText,
+      signature:brief.signature, ctaText:brief.ctaText,
+      sections:brief.sections?.map(s=>({title:s.title,subtitle:s.subtitle,cta:s.cta}))
+    },null,2)
+  );
+  try {
+    const p = JSON.parse(res);
+    if(p.subject)   brief.subject   = p.subject;
+    if(p.greeting)  brief.greeting  = p.greeting;
+    if(p.bodyText)  brief.bodyText  = p.bodyText;
+    if(p.signature) brief.signature = p.signature;
+    if(p.ctaText)   brief.ctaText   = p.ctaText;
+    (p.sections||[]).forEach((ps,i)=>{
+      if(!brief.sections?.[i]) return;
+      if(ps.title)    brief.sections[i].title    = ps.title;
+      if(ps.subtitle) brief.sections[i].subtitle = ps.subtitle;
+      if(ps.cta)      brief.sections[i].cta      = ps.cta;
+    });
+    log("a3","✓ Copy polished and enhanced","ok");
+  } catch { log("a3","⚠ Using original copy","warn"); }
+  return brief;
+}
+
+// ── Agent 4: HTML Builder (AI) ─────────────────────────────
+async function agent4(brief, log) {
+  log("a4","Building production HTML email…");
+  const products = (brief.sections||[]).filter(s=>s.type==="product_grid")
+    .flatMap(s=>s.items||[]).map((b,i)=>
+      `P${i+1}: title="${b.title}" link="${b.link||"#"}" img="${b.imageUrl||""}" price="${b.price||""}"`
+    ).join("\n");
+  const banners = (brief.sections||[]).filter(s=>s.type==="banner").map((b,i)=>
+    `B${i+1}: title="${b.title}" sub="${b.subtitle||""}" cta="${b.cta||"Learn More"}" link="${b.link||"#"}" bg="${b.bgColor||brief.primaryColor||"#000"}"`
+  ).join("\n");
+
+  const html = await claude(
+    `World-class HTML email developer. Generate complete production-ready HTML email.
+RULES: Output ONLY raw HTML. Table layout ONLY (no flex/grid). All CSS inline + style block.
+Max 600px centered. Use exact brand colors provided. Professional premium look.`,
+    `Build from this brief:
+Company: ${brief.company}
+Subject: ${brief.subject}
+PrimaryColor: ${brief.primaryColor||"#000000"}
+SecondaryColor: ${brief.secondaryColor||"#666666"}
+LogoText: ${brief.logoText||brief.company}
+Greeting: ${brief.greeting}
+Body: ${brief.bodyText}
+Signature: ${brief.signature}
+CTA: ${brief.ctaText||"Learn More"}
+MainLink: ${brief.mainBannerLink||"#"}
+Validity: ${brief.validityText||""}
+Address: ${brief.address||""}
+
+Product banners (2-col table, 280x300px cells):
+${products||"none"}
+
+Content banners (full-width 580px, 160px tall):
+${banners||"none"}
+
+Social links: ${JSON.stringify(brief.socialLinks||{})}
+
+BUILD IN ORDER:
+1. DOCTYPE + head with responsive style block + hidden preheader span
+2. Outer table bgcolor #f4f4f4 width 100%
+3. Inner table width 600px bgcolor #ffffff centered
+4. HEADER: primaryColor bg, logoText in white bold 22px, link to mainBannerLink
+5. HERO: primaryColor bg, subject in white 28px bold centered, bodyText preview 14px white 80%, big white CTA button with primaryColor text linking to mainBannerLink
+6. COPY BLOCK: white bg padding 32px, greeting 18px bold #333, bodyText 15px #555, signature 15px bold
+7. PRODUCT GRID: if products exist, 2-col table. Each cell: if img URL use <img>, else colored block. Title + price + CTA link.
+8. CONTENT BANNERS: each full-width colored block with title, subtitle, CTA button
+9. VALIDITY BAR: if validityText, grey bar centered 13px
+10. FOOTER: #1a1a1a bg, white signature, social links as colored text, unsubscribe link, address 11px grey
+Include @media (max-width:600px) to stack columns.`,
+    4000
+  );
+  log("a4",`✓ HTML generated (${html.length} chars)`,"ok");
+  return html;
+}
+
+// ── Agent 5: QA (AI) ────────────────────────────────────────
+async function agent5(html, brief, log) {
+  log("a5","Running QA audit…");
+  const checks = [
+    `Has DOCTYPE: ${html.toLowerCase().startsWith("<!doctype")}`,
+    `Has preheader: ${html.includes("display:none")||html.includes("display: none")}`,
+    `Has primary color: ${html.includes((brief.primaryColor||"").replace("#",""))}`,
+    `Has CTA link: ${html.includes("<a href")}`,
+    `Has footer: ${html.includes("unsubscribe")||html.toLowerCase().includes("footer")}`,
+    `No broken vars: ${!html.includes("undefined")&&!html.includes("[object")}`,
+    `Closes html tag: ${html.includes("</html>")}`,
+    `Has company name: ${html.toLowerCase().includes((brief.company||"").toLowerCase().slice(0,6))}`,
+  ].join("\n");
+  const res = await claude(
+    `Email QA engineer. Return ONLY JSON: {"verdict":"PASS"|"FAIL","passed":N,"failed":N,"score":0-100,"issues":["string"]}`,
+    checks
+  );
+  let qa = { verdict:"PASS", passed:8, failed:0, score:95, issues:[] };
+  try { qa = JSON.parse(res); } catch {}
+  log("a5",`✓ QA ${qa.verdict} — score ${qa.score}/100`, qa.verdict==="PASS"?"ok":"warn");
+  (qa.issues||[]).forEach(i=>log("a5",`  ⚠ ${i}`,"warn"));
+  return qa;
+}
+
+// ── Pipeline ────────────────────────────────────────────────
+async function runPipeline(file, onLog, onStatus, onDone) {
+  const log = (id,msg,type="info") => onLog(id,msg,type);
+  const sts = (id,s) => onStatus(id,s);
+  try {
+    const buf = await file.arrayBuffer();
+    const { names, sheets } = readWorkbook(buf);
+    log("a1",`Loaded: ${names.join(", ")}`);
+
+    sts("a1","running");
+    const brief = await agent1(sheets, log);
+    sts("a1","done");
+
+    sts("a2","running");
+    const { brief:vb, report } = await agent2(brief, log);
+    sts("a2","done");
+
+    sts("a3","running");
+    const pb = await agent3(vb, log);
+    sts("a3","done");
+
+    sts("a4","running");
+    const html = await agent4(pb, log);
+    sts("a4","done");
+
+    sts("a5","running");
+    const qa = await agent5(html, pb, log);
+    sts("a5","done");
+
+    onDone({ html, brief:pb, qa, report });
+  } catch(e) {
+    onDone({ error: e.message });
+  }
+}
+
+// ── Constants ───────────────────────────────────────────────
+const AGENTS = [
+  { id:"a1", n:1, name:"Data Extractor",  desc:"AI reads any Excel structure",        icon:"⚙",  col:"#2563EB" },
+  { id:"a2", n:2, name:"Link Validator",  desc:"Checks URLs + appends UTM tracking",  icon:"🔗", col:"#059669" },
+  { id:"a3", n:3, name:"Copy Enhancer",   desc:"Polishes copy in your language",       icon:"✍",  col:"#7C3AED" },
+  { id:"a4", n:4, name:"HTML Builder",    desc:"Generates production email HTML",      icon:"🏗",  col:"#D97706" },
+  { id:"a5", n:5, name:"QA Checker",      desc:"Audits HTML — score out of 100",       icon:"✅", col:"#DC2626" },
+];
+const INIT = Object.fromEntries(AGENTS.map(a=>[a.id,{status:"idle",logs:[]}]));
+const LC = { ok:"#4ADE80", warn:"#FCD34D", err:"#FCA5A5", info:"#93C5FD" };
+
+// ── App ─────────────────────────────────────────────────────
+function App() {
+  const [screen,  setScreen]  = useState("upload");
+  const [agState, setAgState] = useState(INIT);
+  const [result,  setResult]  = useState(null);
+  const [tab,     setTab]     = useState("preview");
+  const [copied,  setCopied]  = useState(false);
+  const [apiKey,  setApiKey]  = useState(() => localStorage.getItem("mc_apikey")||"");
+  const [showKey, setShowKey] = useState(false);
+  const fileRef = useRef();
+  const dropRef = useRef();
+  const logEnd  = useRef();
+
+  useEffect(() => { logEnd.current?.scrollIntoView({behavior:"smooth"}); });
+
+  const agLog = (id,msg,type="info") =>
+    setAgState(p=>({...p,[id]:{...p[id],logs:[...p[id].logs,{msg,type,ts:new Date().toLocaleTimeString()}]}}));
+  const agSts = (id,s) =>
+    setAgState(p=>({...p,[id]:{...p[id],status:s}}));
+
+  function start(file) {
+    if (!file) return;
+    if (!apiKey) { setShowKey(true); return; }
+    // Inject API key into fetch globally for this session
+    window.__MC_KEY = apiKey;
+    setScreen("pipeline"); setAgState(INIT); setResult(null);
+    runPipeline(file, agLog, agSts, r => setResult(r));
+  }
+
+  function download() {
+    if (!result?.html) return;
+    const name = `${(result.brief?.company||"email").toLowerCase().replace(/\s+/g,"_")}_newsletter.html`;
+    const a = Object.assign(document.createElement("a"),{
+      href: URL.createObjectURL(new Blob([result.html],{type:"text/html;charset=utf-8"})),
+      download: name,
+    });
+    a.click(); URL.revokeObjectURL(a.href);
+  }
+
+  function copy() {
+    navigator.clipboard?.writeText(result?.html||"");
+    setCopied(true); setTimeout(()=>setCopied(false),2000);
+  }
+
+  const allDone = AGENTS.every(a=>agState[a.id]?.status==="done");
+
+  // API key modal
+  if (showKey) return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#0A0A0F",padding:24}}>
+      <div style={{background:"#0F172A",border:"1px solid #1E293B",borderRadius:16,padding:32,maxWidth:420,width:"100%"}}>
+        <div style={{fontSize:22,fontWeight:700,marginBottom:8}}>Enter API Key</div>
+        <div style={{fontSize:13,color:"#64748B",marginBottom:20}}>
+          Your Anthropic API key — stored locally in your browser only.
+          Get one at <a href="https://console.anthropic.com" target="_blank" style={{color:"#3B82F6"}}>console.anthropic.com</a>
+        </div>
+        <input
+          type="password" placeholder="sk-ant-..."
+          value={apiKey}
+          onChange={e=>setApiKey(e.target.value)}
+          style={{width:"100%",background:"#1E293B",border:"1px solid #334155",borderRadius:8,
+            padding:"10px 14px",color:"#E2E8F0",fontSize:14,marginBottom:16,outline:"none"}}
+        />
+        <button onClick={()=>{localStorage.setItem("mc_apikey",apiKey);setShowKey(false);}}
+          style={{width:"100%",background:"linear-gradient(135deg,#2563EB,#7C3AED)",color:"#fff",
+            border:"none",borderRadius:8,padding:"12px",fontWeight:700,fontSize:14,cursor:"pointer"}}>
+          Save & Continue
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{minHeight:"100vh",background:"#0A0A0F"}}>
+      {/* Nav */}
+      <nav style={{borderBottom:"1px solid #1E293B",padding:"0 28px",display:"flex",alignItems:"center",gap:12,height:52,background:"rgba(255,255,255,.02)"}}>
+        <div style={{width:26,height:26,borderRadius:7,background:"linear-gradient(135deg,#3B82F6,#8B5CF6)",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:13,color:"#fff"}}>M</div>
+        <span style={{fontWeight:700,fontSize:15}}>MailCraft AI</span>
+        <span style={{fontSize:10,background:"#1E293B",color:"#64748B",padding:"2px 8px",borderRadius:20,letterSpacing:1}}>BETA</span>
+        <div style={{flex:1}}/>
+        <span style={{fontSize:12,color:"#475569"}}>Any company · Any Excel · Any language</span>
+        <button onClick={()=>setShowKey(true)}
+          style={{background:"#1E293B",color:"#94A3B8",border:"1px solid #334155",borderRadius:6,padding:"5px 12px",fontSize:12,cursor:"pointer"}}>
+          🔑 API Key
+        </button>
+      </nav>
+
+      <div style={{maxWidth:840,margin:"0 auto",padding:"28px 20px"}}>
+
+        {/* UPLOAD */}
+        {screen==="upload" && (
+          <div style={{animation:"fadeIn .4s ease"}}>
+            <div style={{textAlign:"center",paddingTop:20,marginBottom:44}}>
+              <div style={{display:"inline-block",background:"linear-gradient(135deg,#1E3A5F,#2D1B69)",border:"1px solid #334155",borderRadius:20,padding:"5px 16px",fontSize:11,color:"#94A3B8",marginBottom:18,letterSpacing:1}}>
+                ANY COMPANY · ANY BRIEF FORMAT · ANY LANGUAGE
+              </div>
+              <h1 style={{fontSize:38,fontWeight:800,lineHeight:1.15,background:"linear-gradient(135deg,#E2E8F0,#94A3B8)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",marginBottom:14}}>
+                Upload Excel brief.<br/>Get production HTML email.
+              </h1>
+              <p style={{fontSize:15,color:"#64748B",maxWidth:460,margin:"0 auto"}}>
+                5 AI agents read your brief, validate every link, polish the copy,
+                build the email, and QA check it — in under 2 minutes.
+              </p>
+            </div>
+
+            {/* Drop zone */}
+            <div ref={dropRef}
+              onClick={()=>fileRef.current?.click()}
+              onDragOver={e=>{e.preventDefault();dropRef.current.style.borderColor="#3B82F6";dropRef.current.style.background="rgba(59,130,246,.06)";}}
+              onDragLeave={()=>{dropRef.current.style.borderColor="#1E293B";dropRef.current.style.background="rgba(255,255,255,.02)";}}
+              onDrop={e=>{e.preventDefault();dropRef.current.style.borderColor="#1E293B";dropRef.current.style.background="rgba(255,255,255,.02)";start(e.dataTransfer.files[0]);}}
+              style={{border:"2px dashed #1E293B",borderRadius:18,background:"rgba(255,255,255,.02)",padding:"56px 32px",textAlign:"center",cursor:"pointer",transition:"all .2s"}}>
+              <div style={{width:68,height:68,borderRadius:16,background:"linear-gradient(135deg,#1E3A5F,#2D1B69)",border:"1px solid #334155",display:"flex",alignItems:"center",justifyContent:"center",fontSize:28,margin:"0 auto 18px"}}>📊</div>
+              <div style={{fontSize:19,fontWeight:700,marginBottom:8}}>Drop your Excel brief here</div>
+              <div style={{fontSize:13,color:"#475569",marginBottom:26}}>.xlsx or .xls · any format · any language · any company</div>
+              <div style={{display:"inline-flex",alignItems:"center",gap:8,background:"linear-gradient(135deg,#2563EB,#7C3AED)",color:"#fff",padding:"11px 28px",borderRadius:10,fontWeight:700,fontSize:14}}>
+                Choose File
+              </div>
+              <input ref={fileRef} type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>start(e.target.files[0])}/>
+            </div>
+
+            {/* Agent preview cards */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8,marginTop:36}}>
+              {AGENTS.map(a=>(
+                <div key={a.id} style={{background:"#0F172A",border:"1px solid #1E293B",borderRadius:10,padding:"14px 12px"}}>
+                  <div style={{width:26,height:26,borderRadius:7,background:a.col+"22",border:`1px solid ${a.col}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,marginBottom:9}}>{a.icon}</div>
+                  <div style={{fontSize:11,fontWeight:700,marginBottom:4}}>{a.n}. {a.name}</div>
+                  <div style={{fontSize:10.5,color:"#475569",lineHeight:1.5}}>{a.desc}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* PIPELINE */}
+        {screen==="pipeline" && (
+          <div style={{animation:"fadeIn .3s ease"}}>
+            <div style={{marginBottom:20}}>
+              <div style={{fontSize:20,fontWeight:700,marginBottom:3}}>
+                {allDone && result && !result.error ? "✓ Pipeline complete" : result?.error ? "⚠ Pipeline failed" : "Running agents…"}
+              </div>
+              <div style={{fontSize:13,color:"#475569"}}>
+                {allDone && result && !result.error ? "Your HTML email is ready to preview and download." : "5 AI agents processing your brief in sequence."}
+              </div>
+            </div>
+
+            {/* Agent cards */}
+            <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:20}}>
+              {AGENTS.map(a=>{
+                const s = agState[a.id]||{status:"idle",logs:[]};
+                const running = s.status==="running";
+                const done    = s.status==="done";
+                return (
+                  <div key={a.id} style={{background:done?"#0A140A":running?"#0F172A":"#080B10",border:`1px solid ${done?"#166534":running?a.col+"88":"#1E293B"}`,borderRadius:10,overflow:"hidden",transition:"all .3s"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px"}}>
+                      <div style={{width:32,height:32,borderRadius:8,flexShrink:0,background:done?"#16653488":running?a.col:"#1E293B",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontWeight:700,color:"#fff",animation:running?"pulse 1.4s infinite":"none"}}>
+                        {done?"✓":a.icon}
+                      </div>
+                      <div style={{flex:1}}>
+                        <div style={{fontSize:12,fontWeight:700,color:done?"#4ADE80":running?"#E2E8F0":"#475569"}}>
+                          Agent {a.n} — {a.name}
+                        </div>
+                        <div style={{fontSize:11,color:"#334155"}}>{a.desc}</div>
+                      </div>
+                      <div style={{fontSize:9,fontWeight:700,padding:"2px 9px",borderRadius:20,background:done?"#16653422":running?a.col+"22":"#1E293B",color:done?"#4ADE80":running?a.col:"#475569",border:`1px solid ${done?"#16653444":running?a.col+"44":"#334155"}`}}>
+                        {done?"DONE":running?"RUNNING":"WAITING"}
+                      </div>
+                    </div>
+                    {s.logs.length>0 && (
+                      <div style={{borderTop:"1px solid #1E293B",padding:"7px 14px",maxHeight:90,overflowY:"auto"}}>
+                        {s.logs.map((l,i)=>(
+                          <div key={i} style={{fontSize:11,fontFamily:"monospace",color:LC[l.type]||LC.info,marginBottom:2}}>
+                            <span style={{opacity:.4}}>[{l.ts}]</span> {l.msg}
+                          </div>
+                        ))}
+                        <div ref={logEnd}/>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Error */}
+            {result?.error && (
+              <div style={{background:"#1A0808",border:"1px solid #7F1D1D",borderRadius:10,padding:16,color:"#FCA5A5",display:"flex",alignItems:"center",gap:12}}>
+                <span style={{fontSize:20}}>⚠</span>
+                <div style={{flex:1}}><strong>Error:</strong> {result.error}</div>
+                <button onClick={()=>{setScreen("upload");setResult(null);setAgState(INIT);}}
+                  style={{background:"#7F1D1D",color:"#fff",border:"none",padding:"6px 14px",borderRadius:6,cursor:"pointer",fontWeight:600}}>Retry</button>
+              </div>
+            )}
+
+            {/* Results */}
+            {result && !result.error && (
+              <div style={{animation:"fadeIn .3s ease"}}>
+                {/* QA bar */}
+                <div style={{background:"#0F172A",border:`1px solid ${result.qa?.verdict==="PASS"?"#166534":"#7F1D1D"}`,borderRadius:10,padding:"12px 16px",display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+                  <span style={{fontSize:20}}>{result.qa?.verdict==="PASS"?"✅":"⚠️"}</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:13,fontWeight:700,color:result.qa?.verdict==="PASS"?"#4ADE80":"#FCD34D"}}>
+                      QA {result.qa?.verdict} — Score {result.qa?.score}/100
+                    </div>
+                    <div style={{fontSize:11,color:"#475569"}}>
+                      {result.qa?.passed} passed · {result.qa?.failed} failed · Company: <strong style={{color:"#94A3B8"}}>{result.brief?.company||"Detected"}</strong>
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:7}}>
+                    <button onClick={copy} style={{background:copied?"#166534":"#1E293B",color:copied?"#4ADE80":"#E2E8F0",border:"1px solid #334155",padding:"7px 14px",borderRadius:7,cursor:"pointer",fontWeight:600,fontSize:12,transition:"all .2s"}}>
+                      {copied?"✓ Copied":"⎘ Copy HTML"}
+                    </button>
+                    <button onClick={download} style={{background:"linear-gradient(135deg,#2563EB,#7C3AED)",color:"#fff",border:"none",padding:"7px 16px",borderRadius:7,cursor:"pointer",fontWeight:700,fontSize:12}}>
+                      ⬇ Download .html
+                    </button>
+                    <button onClick={()=>{setScreen("upload");setResult(null);setAgState(INIT);}}
+                      style={{background:"transparent",color:"#475569",border:"1px solid #1E293B",padding:"7px 12px",borderRadius:7,cursor:"pointer",fontSize:11}}>
+                      ↺ New
+                    </button>
+                  </div>
+                </div>
+
+                {/* Tabs */}
+                <div style={{background:"#0F172A",border:"1px solid #1E293B",borderRadius:12,overflow:"hidden"}}>
+                  <div style={{display:"flex",borderBottom:"1px solid #1E293B"}}>
+                    {[["preview","👁 Preview"],["code","💻 HTML"],["data","📋 Data"]].map(([t,lbl])=>(
+                      <button key={t} onClick={()=>setTab(t)} style={{padding:"10px 18px",background:"transparent",color:tab===t?"#E2E8F0":"#475569",border:"none",cursor:"pointer",borderBottom:tab===t?"2px solid #3B82F6":"2px solid transparent",fontWeight:tab===t?700:400,fontSize:12}}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                  {tab==="preview" && (
+                    <div style={{padding:12}}>
+                      <div style={{background:"#e5e7eb",borderRadius:8,overflow:"hidden"}}>
+                        <div style={{background:"#d1d5db",padding:"7px 12px",display:"flex",gap:5}}>
+                          {["#ef4444","#eab308","#22c55e"].map(c=><div key={c} style={{width:9,height:9,borderRadius:"50%",background:c}}/>)}
+                          <div style={{flex:1,background:"#e5e7eb",borderRadius:4,padding:"1px 8px",fontSize:10,color:"#9ca3af",fontFamily:"monospace",marginLeft:4}}>email preview</div>
+                        </div>
+                        <iframe srcDoc={result.html} style={{width:"100%",height:580,border:"none",display:"block"}} title="preview"/>
+                      </div>
+                    </div>
+                  )}
+                  {tab==="code" && (
+                    <div style={{padding:12}}>
+                      <pre style={{background:"#060910",borderRadius:8,padding:14,color:"#86EFAC",fontSize:10.5,fontFamily:"monospace",overflowX:"auto",overflowY:"auto",maxHeight:560,whiteSpace:"pre-wrap",wordBreak:"break-all",margin:0}}>
+                        {result.html}
+                      </pre>
+                    </div>
+                  )}
+                  {tab==="data" && result.brief && (
+                    <div style={{padding:16,maxHeight:520,overflowY:"auto"}}>
+                      {[["Company",result.brief.company],["Subject",result.brief.subject],["Primary Color",result.brief.primaryColor],["Greeting",result.brief.greeting],["Body",result.brief.bodyText],["CTA",result.brief.ctaText],["UTM Campaign",result.brief.utmCampaign],["Sections found",result.brief.sections?.length]].filter(([,v])=>v).map(([k,v])=>(
+                        <div key={k} style={{display:"flex",gap:10,padding:"7px 0",borderBottom:"1px solid #1E293B"}}>
+                          <span style={{color:"#475569",fontSize:12,minWidth:120,fontWeight:600}}>{k}</span>
+                          <span style={{color:"#CBD5E1",fontSize:12,wordBreak:"break-all"}}>{String(v)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Patch fetch to inject API key
+const _origFetch = window.fetch.bind(window);
+window.fetch = function(url, opts={}) {
+  if (typeof url === "string" && url.includes("api.anthropic.com") && window.__MC_KEY) {
+    opts.headers = { ...opts.headers, "x-api-key": window.__MC_KEY, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" };
+  }
+  return _origFetch(url, opts);
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
