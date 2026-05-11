@@ -5,21 +5,79 @@ import * as XLSX from "xlsx";
 // CLAUDE API — single shared caller
 // ─────────────────────────────────────────────────────────────
 async function claude(system, user, maxTokens = 3000) {
-  const res = await fetch("https://ai-api-dev.dentsu.com", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Ocp-Apim-Subscription-Key": "d9087da1250e438782aa1cd9b0c38561" },
-    body: JSON.stringify({
-      model: "claude-opus-4-6",
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: "user", content: user }],
-    }),
-  });
-  if (!res.ok) throw new Error(`API error ${res.status}`);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
-  const text = data.content?.find((b) => b.type === "text")?.text || "";
-  return text.replace(/^```(?:json|html)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  // Get Azure configuration from environment variables
+  const azureEndpoint = import.meta.env.VITE_AZURE_OPENAI_ENDPOINT;
+  const azureApiKey = import.meta.env.VITE_AZURE_OPENAI_API_KEY;
+  const azureDeployment = import.meta.env.VITE_AZURE_OPENAI_DEPLOYMENT_NAME;
+  const azureApiVersion = import.meta.env.VITE_AZURE_OPENAI_API_VERSION || "2024-05-01-preview";
+
+  // Validate all required configuration
+  if (!azureEndpoint) {
+    throw new Error("VITE_AZURE_OPENAI_ENDPOINT not set in environment variables. Add it to your .env.local");
+  }
+  if (!azureApiKey) {
+    throw new Error("VITE_AZURE_OPENAI_API_KEY not set in environment variables. Add it to your .env.local");
+  }
+  if (!azureDeployment) {
+    throw new Error("VITE_AZURE_OPENAI_DEPLOYMENT_NAME not set in environment variables. Add it to your .env.local");
+  }
+
+  // Build Azure OpenAI endpoint URL
+  // Format: https://{resource-name}.openai.azure.com/openai/deployments/{deployment-id}/chat/completions?api-version={api-version}
+  const url = `${azureEndpoint.replace(/\/$/, '')}/openai/deployments/${azureDeployment}/chat/completions?api-version=${azureApiVersion}`;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": azureApiKey, // Azure uses 'api-key' header instead of 'x-api-key'
+      },
+      body: JSON.stringify({
+        model: azureDeployment, // Azure uses deployment name as model
+        max_tokens: maxTokens,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ],
+        temperature: 0.7,
+      }),
+    });
+
+    // Handle HTTP errors
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({}));
+      const errorMsg = errorData.error?.message || `API error ${res.status}`;
+      throw new Error(`Azure OpenAI API Error (${res.status}): ${errorMsg}`);
+    }
+
+    const data = await res.json();
+
+    // Handle API-level errors
+    if (data.error) {
+      throw new Error(`Azure OpenAI API Error: ${data.error.message}`);
+    }
+
+    // Extract text content from response
+    // Azure returns content in choices[0].message.content
+    const text = data.choices?.[0]?.message?.content || "";
+
+    if (!text) {
+      throw new Error("No response content received from Azure OpenAI API");
+    }
+
+    // Remove markdown code fence wrappers if present
+    return text.replace(/^```(?:json|html)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  } catch (err) {
+    // Provide helpful debugging information
+    if (err.message.includes("401") || err.message.includes("Unauthorized")) {
+      throw new Error("Azure API Key is invalid or expired. Check VITE_AZURE_OPENAI_API_KEY");
+    }
+    if (err.message.includes("404")) {
+      throw new Error("Azure endpoint or deployment not found. Check VITE_AZURE_OPENAI_ENDPOINT and VITE_AZURE_OPENAI_DEPLOYMENT_NAME");
+    }
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
