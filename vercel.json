@@ -1,5 +1,5 @@
 {
-  "version": 2,
-  "builds": [{ "src": "public/**", "use": "@vercel/static" }],
-  "routes": [{ "src": "/(.*)", "dest": "/public/$1" }]
+  "buildCommand": "vite build",
+  "outputDirectory": "dist",
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
